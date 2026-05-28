@@ -50,6 +50,14 @@ test_process_management_uses_pid_file() {
     pass 'process management is scoped through a PID file'
 }
 
+test_background_tasks_uses_owned_pid_file() {
+    grep_fixed 'bg_tasks_running()' "$SCRIPT" \
+        || fail 'script does not validate that the background PID belongs to a live g2ray process'
+    grep_fixed 'bg_tasks_running "$p"' "$SCRIPT" \
+        || fail 'start_background_tasks does not validate background PID ownership'
+    pass 'background supervisor validates PID ownership'
+}
+
 test_background_tasks_require_config() {
     grep_fixed '[[ -f "$CONFIG_FILE" ]] || continue' "$SCRIPT" \
         || fail 'background loop can still start Xray before config exists'
@@ -61,10 +69,35 @@ test_background_tasks_require_config() {
     pass 'background tasks skip Xray start until config exists'
 }
 
+test_port_visibility_failures_are_handled() {
+    if grep -Eq '^[[:space:]]*ensure_codespace_port_public[[:space:]]*>/dev/null 2>&1[[:space:]]*$' "$SCRIPT"; then
+        fail 'bare ensure_codespace_port_public call can exit under set -e without a user-facing message'
+    fi
+    grep_fixed 'Could not set Codespaces port' "$SCRIPT" \
+        || fail 'port-public failure does not produce an actionable user-facing warning'
+    pass 'port visibility failures are handled explicitly'
+}
+
 test_self_update_is_opt_in() {
     grep_fixed 'G2RAY_AUTO_UPDATE' "$SCRIPT" \
         || fail 'self-update is not controlled by an opt-in environment variable'
+    grep_fixed 'bash -n "$tmp"' "$SCRIPT" \
+        || fail 'self-update does not syntax-check the downloaded script before replacing itself'
+    if grep_fixed 'cat "$tmp" > "$0"' "$SCRIPT"; then
+        fail 'self-update still writes directly over the running script'
+    fi
     pass 'self-update is opt-in'
+}
+
+test_exit_trap_preserves_failures() {
+    grep_fixed 'cleanup()' "$SCRIPT" \
+        || fail 'script does not define an explicit cleanup trap'
+    grep_fixed 'local code=$?' "$SCRIPT" \
+        || fail 'cleanup trap does not preserve the triggering exit status'
+    if grep_fixed "exit 0' EXIT INT TERM" "$SCRIPT"; then
+        fail 'global trap still masks failures as successful exits'
+    fi
+    pass 'exit trap preserves failure status'
 }
 
 test_generated_files_are_ignored() {
@@ -84,20 +117,27 @@ test_xray_version_can_be_pinned() {
     pass 'Dockerfile supports pinned Xray version'
 }
 
-test_generated_link_uses_resolved_address_with_domain_sni() {
+test_generated_links_include_domain_and_ip_variants() {
     grep_fixed 'resolve_domain_ip()' "$SCRIPT" \
         || fail 'script does not provide a resolver for the Codespaces app domain'
-    grep_fixed 'address=$(resolve_domain_ip "$PORT_DOMAIN")' "$SCRIPT" \
-        || fail 'generate_link does not resolve the Codespaces domain for the VLESS address'
+    grep_fixed 'generate_domain_link()' "$SCRIPT" \
+        || fail 'script does not generate a domain-address link'
+    grep_fixed 'generate_ip_link()' "$SCRIPT" \
+        || fail 'script does not generate a resolved-IP fallback link'
     grep_fixed '"$uuid" "$address" "$XRAY_PORT" "$PORT_DOMAIN" "$PORT_DOMAIN"' "$SCRIPT" \
-        || fail 'generate_link must use resolved address while preserving PORT_DOMAIN as SNI and host'
-    pass 'generated links use resolved address with Codespaces domain SNI/host'
+        || fail 'IP fallback link must preserve PORT_DOMAIN as SNI and host'
+    grep_fixed 'generate_link_for_address "$PORT_DOMAIN"' "$SCRIPT" \
+        || fail 'domain link must use PORT_DOMAIN as address, SNI, and host'
+    pass 'generated links include domain and IP variants'
 }
 
 test_wait_for_port_increment_is_set_e_safe
 test_process_management_uses_pid_file
+test_background_tasks_uses_owned_pid_file
 test_background_tasks_require_config
+test_port_visibility_failures_are_handled
 test_self_update_is_opt_in
+test_exit_trap_preserves_failures
 test_generated_files_are_ignored
 test_xray_version_can_be_pinned
-test_generated_link_uses_resolved_address_with_domain_sni
+test_generated_links_include_domain_and_ip_variants

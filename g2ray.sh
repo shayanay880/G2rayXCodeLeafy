@@ -105,7 +105,7 @@ refresh_screen() {
 check_for_updates() {
     [[ "${G2RAY_AUTO_UPDATE:-0}" == "1" ]] || return 0
     clear; draw_logo
-    local tmp="/tmp/g2ray_remote.sh"
+    local tmp="/tmp/g2ray_remote.sh" staged
     curl -s -m 8 -L "https://raw.githubusercontent.com/Code-Leafy/G2rayXCodeLeafy/main/g2ray.sh" -o "$tmp" &
     local pid=$! frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏") i=0
     while kill -0 "$pid" 2>/dev/null; do
@@ -113,10 +113,13 @@ check_for_updates() {
         i=$(( (i+1) % 10 )); sleep 0.1
     done
     wait "$pid" || true
-    if [[ -f "$tmp" ]] && grep -q "G2ray Panel" "$tmp" 2>/dev/null; then
+    if [[ -f "$tmp" ]] && grep -q "G2ray Panel" "$tmp" 2>/dev/null && bash -n "$tmp" 2>/dev/null; then
         if ! cmp -s "$0" "$tmp"; then
             printf "\r  %b✔%b %bUpdate found! Installing...              %b\n" "$GREEN" "$NC" "$WHITE" "$NC"
-            cat "$tmp" > "$0"; chmod +x "$0"
+            staged=$(mktemp "${0}.XXXXXX")
+            cp "$tmp" "$staged"
+            chmod +x "$staged"
+            mv -f "$staged" "$0"
             printf "  %b✔%b %bUpdate applied! Restarting...%b\n" "$GREEN" "$NC" "$WHITE" "$NC"
             sleep 1.5; exec bash "$0" "$@"
         else
@@ -180,10 +183,10 @@ is_port_open() {
 }
 
 ensure_codespace_port_public() {
-    command -v gh >/dev/null 2>&1 || return 0
+    command -v gh >/dev/null 2>&1 || return 1
     GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 NO_COLOR=1 GH_FORCE_TTY=0 \
         gh codespace ports visibility "${XRAY_PORT}:public" -c "$CODESPACE_NAME" \
-        </dev/null >/dev/null 2>&1 || true
+        </dev/null >/dev/null 2>&1
 }
 
 save_xray_stats() {
@@ -320,11 +323,18 @@ _background_tasks() {
 start_background_tasks() {
     if [[ -f "$BG_TASKS_PID" ]]; then
         local p; p=$(cat "$BG_TASKS_PID" 2>/dev/null || true)
-        [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null && return 0
+        bg_tasks_running "$p" && return 0
     fi
     _background_tasks </dev/null >/dev/null 2>&1 &
     printf '%s\n' $! > "$BG_TASKS_PID"
     disown 2>/dev/null || true
+}
+
+bg_tasks_running() {
+    local p="${1:-}"
+    [[ "$p" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$p" 2>/dev/null || return 1
+    ps -p "$p" -o args= 2>/dev/null | grep -Fq "g2ray.sh"
 }
 
 format_bytes() {
@@ -379,7 +389,13 @@ check_port_visibility() {
         echo -ne "  ${DIM}Press Enter to return...${NC}"; read -r
         return 1
     fi
-    ensure_codespace_port_public
+    if ! ensure_codespace_port_public; then
+        refresh_screen
+        echo -e "  ${YELLOW}⚠ Could not set Codespaces port ${XRAY_PORT} public.${NC}"
+        echo -e "  ${DIM}Open the PORTS tab and set port ${XRAY_PORT} visibility to Public.${NC}\n"
+        echo -ne "  ${DIM}Press Enter to return...${NC}"; read -r
+        return 1
+    fi
 }
 
 generate_config() {
@@ -437,15 +453,34 @@ JSONEOF
     else
         echo -e "  ${YELLOW}⚠ Engine may not have bound to port ${XRAY_PORT}.${NC}"
     fi
-    ensure_codespace_port_public
+    ensure_codespace_port_public || echo -e "  ${YELLOW}⚠ Could not set Codespaces port ${XRAY_PORT} public. Check the PORTS tab.${NC}"
+}
+
+generate_link_for_address() {
+    local address="$1" uuid
+    uuid=$(cat "$UUID_FILE" 2>/dev/null) || { printf ''; return 1; }
+    [[ -z "$uuid" ]] && { printf ''; return 1; }
+    printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2&insecure=1&allowInsecure=1&type=xhttp&host=%s&path=%%2F&mode=packet-up#G2rayXCodeLeafy|%s' \
+        "$uuid" "$address" "$XRAY_PORT" "$PORT_DOMAIN" "$PORT_DOMAIN" "${GITHUB_USER:-User}"
+}
+
+generate_domain_link() {
+    generate_link_for_address "$PORT_DOMAIN"
+}
+
+generate_ip_link() {
+    local address; address=$(resolve_domain_ip "$PORT_DOMAIN")
+    generate_link_for_address "$address"
 }
 
 generate_link() {
+    generate_domain_link
+}
+
+generate_links_for_display() {
     local uuid; uuid=$(cat "$UUID_FILE" 2>/dev/null) || { printf ''; return 1; }
     [[ -z "$uuid" ]] && { printf ''; return 1; }
-    local address; address=$(resolve_domain_ip "$PORT_DOMAIN")
-    printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2&insecure=1&allowInsecure=1&type=xhttp&host=%s&path=%%2F&mode=packet-up#G2rayXCodeLeafy|%s' \
-        "$uuid" "$address" "$XRAY_PORT" "$PORT_DOMAIN" "$PORT_DOMAIN" "${GITHUB_USER:-User}"
+    printf '%s\n%s\n' "$(generate_domain_link)" "$(generate_ip_link)"
 }
 
 do_donate_config() {
@@ -489,8 +524,9 @@ force_reconnect() {
         || echo -e "${RED}Failed${NC}"
 
     echo -ne "  ${DIM}├─${NC} Expose Tunnel     : "
-    ensure_codespace_port_public >/dev/null 2>&1
-    echo -e "${GREEN}Done${NC}"
+    ensure_codespace_port_public >/dev/null 2>&1 \
+        && echo -e "${GREEN}Done${NC}" \
+        || echo -e "${YELLOW}Needs PORTS tab${NC}"
 
     echo -ne "  ${DIM}╰─${NC} Verify External   : "
     local ok=false code
@@ -510,14 +546,22 @@ force_reconnect() {
 if [[ "${1:-}" == "--silent-start" ]]; then
     stop_xray >/dev/null 2>&1
     if [[ -f "$CONFIG_FILE" ]] && start_xray >/dev/null 2>&1 && wait_for_port >/dev/null 2>&1; then
-        ensure_codespace_port_public
+        ensure_codespace_port_public >/dev/null 2>&1 || true
     fi
     start_background_tasks
     exit 0
 fi
 
-trap 'save_xray_stats 2>/dev/null||true; save_session_uptime 2>/dev/null||true
-      echo -e "\n  ${DIM}Goodbye.${NC}"; exit 0' EXIT INT TERM
+cleanup() {
+    local code=$?
+    save_xray_stats 2>/dev/null || true
+    save_session_uptime 2>/dev/null || true
+    echo -e "\n  ${DIM}Goodbye.${NC}"
+    exit "$code"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 check_for_updates "$@"
 start_background_tasks
@@ -593,9 +637,10 @@ while true; do
     case $_choice in
         1)
             check_port_visibility || continue
-            _VLESS=$(generate_link)
+            _VLESS=$(generate_domain_link) || _VLESS=""
+            _VLESS_IP=$(generate_ip_link) || _VLESS_IP=""
             [[ -z "$_VLESS" ]] && { echo -e "  ${RED}✖ Error generating link.${NC}"; sleep 2; continue; }
-            printf '%s\n' "$_VLESS" > "$MOBILE_CONFIG_FILE"
+            printf '%s\n%s\n' "$_VLESS" "$_VLESS_IP" > "$MOBILE_CONFIG_FILE"
             _VHASH=$(printf '%s' "$_VLESS" | md5sum | awk '{print $1}')
             _PFLAG="$DATA_DIR/.prompted_${_VHASH}"
             if [[ ! -f "$_PFLAG" ]]; then
@@ -609,14 +654,18 @@ while true; do
                 touch "$_PFLAG"
             fi
             refresh_screen
-            echo -e "  ${GREEN}● Scan to Connect${NC}"
+            echo -e "  ${GREEN}● Scan to Connect (Domain Link)${NC}"
             if command -v qrencode >/dev/null 2>&1; then
                 qrencode -m 2 -t ANSIUTF8 "$_VLESS" | sed 's/^/  /'
             else
                 echo -e "  ${DIM}(qrencode not installed — QR unavailable)${NC}"
             fi
-            echo -e "\n  ${GREEN}● Direct VLESS Link${NC}"
+            echo -e "\n  ${GREEN}● Direct VLESS Link (try this first)${NC}"
             echo -e "  ${WHITE}${_VLESS}${NC}\n"
+            if [[ -n "$_VLESS_IP" && "$_VLESS_IP" != "$_VLESS" ]]; then
+                echo -e "  ${GREEN}● IP Fallback Link (try if your client rejects the first)${NC}"
+                echo -e "  ${WHITE}${_VLESS_IP}${NC}\n"
+            fi
             _COUNTRY=$(curl -s --max-time 3 https://ipinfo.io/country </dev/null 2>/dev/null || echo "Unknown")
             if [[ "$_COUNTRY" != "DE" && "$_COUNTRY" != "NL" && "$_COUNTRY" != "Unknown" ]]; then
                 echo -e "  ${RED}⚠ WARNING: Codespace is NOT in Germany (${_COUNTRY})!${NC}"
@@ -636,7 +685,8 @@ while true; do
                 echo -e "\n  ${WHITE}Engine is already running.${NC}"
             else
                 if start_xray && wait_for_port; then
-                    ensure_codespace_port_public
+                    ensure_codespace_port_public \
+                        || echo -e "  ${YELLOW}⚠ Could not set port public. Use the PORTS tab.${NC}"
                 fi
             fi
             sleep 1
@@ -648,7 +698,8 @@ while true; do
             ;;
         5)
             if start_xray && wait_for_port; then
-                ensure_codespace_port_public
+                ensure_codespace_port_public \
+                    || echo -e "  ${YELLOW}⚠ Could not set port public. Use the PORTS tab.${NC}"
             fi
             sleep 1
             ;;
